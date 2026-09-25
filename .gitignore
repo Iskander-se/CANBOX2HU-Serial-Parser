@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+.vscode/settings.json
+include/README
+lib/README
+sdkconfig.esp32-s3-supermini
