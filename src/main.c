@@ -23,7 +23,7 @@
 #define BAUDRATE           115200
 #define BUF_SIZE           2048
 
-// Ring buffers for byte-level data
+// Circular buffers for byte stream data
 static RingbufHandle_t ringbuf_can_to_hu = NULL;
 static RingbufHandle_t ringbuf_hu_to_can = NULL;
 
@@ -31,7 +31,11 @@ static RingbufHandle_t ringbuf_hu_to_can = NULL;
 static uint8_t g_current_speed_kmh = 0;
 static bool g_speed_over_40 = false;
 
-// Template for silence for PDC audio status (0x20)
+// Packet counters for brief logs
+static uint32_t g_pkt_count_can_to_hu = 0;
+static uint32_t g_pkt_count_hu_to_can = 0;
+
+// Silence template for PDC audio status (0x20)
 static const uint8_t PDC_CLEAR_AUDIO[] = { 0x2E, 0x20, 0x02, 0x00, 0x00, 0xDB };
 
 /**
@@ -66,13 +70,39 @@ static void init_uarts(void) {
     uart_driver_install(HU_UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0);
 }
 
+// Definition of packet type by CMD for brief log
+static const char* get_packet_type_name(uint8_t cmd) {
+    switch (cmd) {
+        case 0x14:
+        case 0x24: return "SPEED_STATUS";
+        case 0x20: return "PDC_AUDIO";
+        case 0x26: return "PDC_PLA3";
+        case 0x21: return "STEERING_WHEEL";
+        case 0x40: return "CLIMATE_CONTROL";
+        case 0x28:
+        case 0x50: return "SYSTEM_INFO";
+        default:   return "OTHER_CMD";
+    }
+}
+
+// Sending brief report (brief) to USB CDC
+static void send_brief_to_usb(const char* dir, uint32_t pkt_num, size_t len, uint8_t cmd) {
+    char msg[80];
+    int msg_len = snprintf(msg, sizeof(msg), "[%s] #%lu | Len:%d | Type:%s (0x%02X)\r\n",
+                          dir, pkt_num, (int)len, get_packet_type_name(cmd), cmd);
+    
+    if (msg_len > 0) {
+        usb_serial_jtag_write_bytes((const uint8_t*)msg, msg_len, 0);
+    }
+}
+
 /**
  * @brief Parsing vehicle speed from CANBOX status packets
  */
 static void parse_vehicle_speed(const uint8_t *pkt, size_t len) {
     uint8_t cmd = pkt[1];
 
-    // Packet 0x14 (Vehicle status)
+    // Packet 0x14 (Vehicle Status)
     if (cmd == 0x14 && len >= 5) {
         g_current_speed_kmh = pkt[4];
     }
@@ -121,56 +151,78 @@ static void send_dynamic_pdc_clear(uint8_t *pkt, size_t len) {
  * @brief Stream parser and filter for CANBOX -> HU packets
  */
 static void filter_and_forward_can_to_hu(const uint8_t *in_buf, size_t in_len) {
-    static uint8_t pkt_buf[256];
-    static size_t pkt_idx = 0;
-    static size_t expected_len = 0;
+    static uint8_t buf[512];
+    static size_t buf_len = 0;
 
-    for (size_t i = 0; i < in_len; i++) {
-        uint8_t b = in_buf[i];
+    // 1. Добавляем входящие байты в кольцевой/накопительный буфер задачи
+    if (buf_len + in_len > sizeof(buf)) {
+        // Переполнение — защита от зацикливания, сбрасываем половинку буфера
+        memmove(buf, buf + (buf_len / 2), buf_len / 2);
+        buf_len /= 2;
+    }
+    memcpy(buf + buf_len, in_buf, in_len);
+    buf_len += in_len;
 
-        if (pkt_idx == 0) {
-            if (b == CANBOX_HEADER) {
-                pkt_buf[pkt_idx++] = b;
-            }
+    // 2. Разбираем накопитель
+    size_t pos = 0;
+    while (pos < buf_len) {
+        // Ищем заголовок 0x2E
+        if (buf[pos] != CANBOX_HEADER) {
+            pos++; // Пропускаем мусор (например 0xFF 0xFF)
             continue;
         }
 
-        pkt_buf[pkt_idx++] = b;
-
-        if (pkt_idx == 3) {
-            uint8_t data_len = pkt_buf[2];
-            expected_len = 3 + data_len + 1;
-
-            if (expected_len > sizeof(pkt_buf)) {
-                pkt_idx = 0;
-                continue;
-            }
+        // Нам нужно минимум 3 байта для определения длины (Header, CMD, LEN)
+        if (buf_len - pos < 3) {
+            break; // Ждем дочитывания из UART
         }
 
-        // Packet fully received in the buffer
-        if (pkt_idx > 3 && pkt_idx == expected_len) {
-            uint8_t cmd = pkt_buf[1];
+        uint8_t cmd = buf[pos + 1];
+        uint8_t data_len = buf[pos + 2];
+        size_t total_pkt_len = 3 + data_len + 1; // Header(1) + CMD(1) + LEN(1) + Data(N) + CS(1)
+
+        // Аномальный размер кадра (валидный пакет CANBOX обычно от 4 до 64 байт)
+        if (data_len == 0 || total_pkt_len > 128) {
+            pos++; // Неверная длина -> 0x2E был ложным (внутри данных), ищем следующий 0x2E
+            continue;
+        }
+
+        // Ждем пока весь пакет долетит полностью
+        if (buf_len - pos < total_pkt_len) {
+            break; 
+        }
+
+        // --- ПАКЕТ ПОЛНОСТЬЮ СОБРАН В buf[pos ... pos + total_pkt_len - 1] ---
+        
+        g_pkt_count_can_to_hu++;
+
+        send_brief_to_usb("CAN->HU", g_pkt_count_can_to_hu, total_pkt_len, cmd);
 
             // Check the current speed
-            parse_vehicle_speed(pkt_buf, pkt_idx);
+            parse_vehicle_speed(&buf[pos], total_pkt_len);
 
-            // Обработка PDC/PLA3.0 (0x26 и 0x20)
-            if (cmd == 0x26 || cmd == 0x20) {
-                if (g_speed_over_40) {
-                    // Upon exceeding 40 km/h, intercept and replace with "all clear"
-                    send_dynamic_pdc_clear(pkt_buf, pkt_idx);
-                } else {
-                    // For speeds <= 40 km/h, forward the original packet
-                    uart_write_bytes(HU_UART_PORT, (const char *)pkt_buf, pkt_idx);
-                }
+        // Remake PDC / PLA 3.0 (0x26 & 0x20)
+        if (cmd == 0x26 || cmd == 0x20) {
+            if (g_speed_over_40) {
+                // Upon exceeding 40 km/h, intercept and replace with "all clear"
+                send_dynamic_pdc_clear(&buf[pos], total_pkt_len);
             } else {
-                // Other packets (steering, climate, doors) are passed through without changes
-                uart_write_bytes(HU_UART_PORT, (const char *)pkt_buf, pkt_idx);
+                // For speeds <= 40 km/h, forward the original packet
+                uart_write_bytes(HU_UART_PORT, (const char *)&buf[pos], total_pkt_len);
             }
-
-            pkt_idx = 0;
-            expected_len = 0;
+        } else {
+            // Other packets (steering, climate, doors) are passed through without changes
+            uart_write_bytes(HU_UART_PORT, (const char *)&buf[pos], total_pkt_len);
         }
+
+        // Сдвигаемся на длину успешного пакета
+        pos += total_pkt_len;
+    }
+
+    // 3. Удаляем из накопительного буфера обработанные байты
+    if (pos > 0) {
+        memmove(buf, buf + pos, buf_len - pos);
+        buf_len -= pos;
     }
 }
 
@@ -184,9 +236,6 @@ void canbox_to_hu_task(void *pvParameters) {
         int len = uart_read_bytes(CANBOX_UART_PORT, rx_tmp_buf, sizeof(rx_tmp_buf), pdMS_TO_TICKS(10));
         
         if (len > 0) {
-            // Дублируем сырой поток в USB CDC для отладки на ПК при необходимости
-            usb_serial_jtag_write_bytes(rx_tmp_buf, len, 0);
-
             xRingbufferSend(ringbuf_can_to_hu, rx_tmp_buf, len, pdMS_TO_TICKS(20));
         }
 
@@ -199,6 +248,54 @@ void canbox_to_hu_task(void *pvParameters) {
         }
 
         vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+/**
+ * @brief Stream parser and forwarder for the reverse stream from Head Unit to CANBOX for brief logs
+ */
+static void parse_and_forward_hu_to_can(const uint8_t *in_buf, size_t in_len) {
+    static uint8_t pkt_buf[256];
+    static size_t pkt_idx = 0;
+    static size_t expected_len = 0;
+
+    for (size_t i = 0; i < in_len; i++) {
+        uint8_t b = in_buf[i];
+
+        if (pkt_idx == 0) {
+            if (b == CANBOX_HEADER) {
+                pkt_buf[pkt_idx++] = b;
+            } else {
+                uart_write_bytes(CANBOX_UART_PORT, (const char *)&b, 1);
+            }
+            continue;
+        }
+
+        pkt_buf[pkt_idx++] = b;
+
+        if (pkt_idx == 3) {
+            uint8_t data_len = pkt_buf[2];
+            expected_len = 3 + data_len + 1;
+
+            if (expected_len > sizeof(pkt_buf)) {
+                uart_write_bytes(CANBOX_UART_PORT, (const char *)pkt_buf, pkt_idx);
+                pkt_idx = 0;
+                continue;
+            }
+        }
+
+        if (pkt_idx > 3 && pkt_idx == expected_len) {
+            uint8_t cmd = pkt_buf[1];
+            g_pkt_count_hu_to_can++;
+
+            // Логируем обратный поток от ГУ в USB CDC
+            send_brief_to_usb("HU->CAN", g_pkt_count_hu_to_can, pkt_idx, cmd);
+
+            uart_write_bytes(CANBOX_UART_PORT, (const char *)pkt_buf, pkt_idx);
+
+            pkt_idx = 0;
+            expected_len = 0;
+        }
     }
 }
 
@@ -219,7 +316,7 @@ void hu_to_canbox_task(void *pvParameters) {
         uint8_t *data = (uint8_t *)xRingbufferReceiveUpTo(ringbuf_hu_to_can, &size, pdMS_TO_TICKS(5), BUF_SIZE);
         
         if (data != NULL) {
-            uart_write_bytes(CANBOX_UART_PORT, (const char *)data, size);
+            parse_and_forward_hu_to_can(data, size);
             vRingbufferReturnItem(ringbuf_hu_to_can, (void *)data);
         }
 
