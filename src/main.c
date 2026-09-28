@@ -27,16 +27,26 @@
 static RingbufHandle_t ringbuf_can_to_hu = NULL;
 static RingbufHandle_t ringbuf_hu_to_can = NULL;
 
-// Vehicle state variables
-static uint8_t g_current_speed_kmh = 0;
-static bool g_speed_over_40 = false;
 
 // Packet counters for brief logs
 static uint32_t g_pkt_count_can_to_hu = 0;
 static uint32_t g_pkt_count_hu_to_can = 0;
 
-// Silence template for PDC audio status (0x20)
-static const uint8_t PDC_CLEAR_AUDIO[] = { 0x2E, 0x20, 0x02, 0x00, 0x00, 0xDB };
+// Vehicle state variables
+typedef struct {
+    uint8_t current_speed_kmh;   // Текущая скорость в км/ч
+    bool    speed_over;       // Флаг превышения порога 40 км/ч
+    size_t  pdc_payload_len;     // Длина данных (LEN, байт 2) в пакете 0x26
+    uint8_t current_speed_limit; // Текущий знак ограничения (0 = нет знака)
+} vehicle_state_t;
+
+static vehicle_state_t g_vehicle = {
+    .current_speed_kmh   = 0,
+    .speed_over       = false,
+    .pdc_payload_len     = 0,
+    .current_speed_limit = 30,
+};
+
 
 /**
  * @brief Initialization of the clearing console output on USB CDC
@@ -75,7 +85,6 @@ static const char* get_packet_type_name(uint8_t cmd) {
     switch (cmd) {
         case 0x14:
         case 0x24: return "SPEED_STATUS";
-        case 0x20: return "PDC_AUDIO";
         case 0x26: return "PDC_PLA3";
         case 0x21: return "STEERING_WHEEL";
         case 0x40: return "CLIMATE_CONTROL";
@@ -97,6 +106,28 @@ static void send_brief_to_usb(const char* dir, uint32_t pkt_num, size_t len, uin
 }
 
 /**
+ * @brief Формирует и отправляет динамический пакет отмены PDC/PLA (0x26) в ГУ
+ */
+static void send_dynamic_pdc_clear(void) {
+    size_t payload_len = (g_vehicle.pdc_payload_len > 0) ? g_vehicle.pdc_payload_len : 12;
+    size_t total_pkt_len = 3 + payload_len + 1;
+
+    if (total_pkt_len > 64) return;
+
+    // Массив сразу занулен ({0}), memset больше не нужен
+    uint8_t pkt[64] = { CANBOX_HEADER, 0x26, (uint8_t)payload_len };
+
+    // Считаем CS (инверсия суммы байт от CMD до конца DATA)
+    uint32_t sum = 0;
+    for (size_t i = 1; i < total_pkt_len - 1; i++) {
+        sum += pkt[i];
+    }
+    pkt[total_pkt_len - 1] = (uint8_t)(~sum);
+
+    uart_write_bytes(HU_UART_PORT, (const char *)pkt, total_pkt_len);
+}
+
+/**
  * @brief Parsing vehicle speed from CANBOX status packets
  */
 static void parse_vehicle_speed(const uint8_t *pkt, size_t len) {
@@ -104,47 +135,84 @@ static void parse_vehicle_speed(const uint8_t *pkt, size_t len) {
 
     // Packet 0x14 (Vehicle Status)
     if (cmd == 0x14 && len >= 5) {
-        g_current_speed_kmh = pkt[4];
+        g_vehicle.current_speed_kmh = pkt[4];
     }
     // Packet 0x24 (Speed / Handbrake)
     else if (cmd == 0x24 && len >= 5) {
-        g_current_speed_kmh = pkt[3];
+        g_vehicle.current_speed_kmh = pkt[3];
     }
 
-    bool prev_state = g_speed_over_40;
-    g_speed_over_40 = (g_current_speed_kmh > 40);
+    bool prev_state = g_vehicle.speed_over;
+    g_vehicle.speed_over = (g_vehicle.current_speed_kmh > 40);
 
     // Upon initial exceeding the 40 km/h threshold, send a cancellation packet
-    if (g_speed_over_40 && !prev_state) {
-        uart_write_bytes(HU_UART_PORT, (const char *)PDC_CLEAR_AUDIO, sizeof(PDC_CLEAR_AUDIO));
+    if (g_vehicle.speed_over && !prev_state) {
+       send_dynamic_pdc_clear();
     }
 }
 
+
+
 /**
- * @brief Dynamic clearing of PLA 3.0 / PDC visualization packet
+ * @brief Safe addition of road sign packet to the send queue for Canbox
+ * 
+ * @param speed_limit SpeedSign (50, 60, 80  etc). 0 — remove sign.
+ * @return true if packet successfully added to the circular buffer
  */
-static void send_dynamic_pdc_clear(uint8_t *pkt, size_t len) {
-    if (len < 4) return;
-
-    uint8_t cmd = pkt[1];
-    uint8_t data_len = pkt[2];
-
-    if (cmd == 0x26) {
-        // Clear all distance bytes according to the length of the incoming packet
-        memset(&pkt[3], 0x00, data_len);
-
-        // Recalculate CS (inversion of byte sum)
-        uint32_t sum = 0;
-        for (size_t i = 1; i < len - 1; i++) {
-            sum += pkt[i];
-        }
-        pkt[len - 1] = (uint8_t)(~sum);
-
-        uart_write_bytes(HU_UART_PORT, (const char *)pkt, len);
-    } 
-    else if (cmd == 0x20) {
-        uart_write_bytes(HU_UART_PORT, (const char *)PDC_CLEAR_AUDIO, sizeof(PDC_CLEAR_AUDIO));
+bool inject_road_sign_to_queue(uint8_t speed_limit) {
+    if (ringbuf_hu_to_can == NULL) {
+        return false;
     }
+
+
+    // Structure: [0x2E] [CMD] [LEN] [DATA0] [DATA1] [DATA2] [DATA3] [CS]
+    uint8_t pkt[8];
+    
+    pkt[0] = CANBOX_HEADER; // 0x2E
+    pkt[1] = 0x32;          // CMD (Навигация / Дорожные знаки для VAG BAP)
+    pkt[2] = 0x04;          // LEN (4 байта данных)
+    
+    pkt[3] = (speed_limit > 0) ? 0x01 : 0x00; // State: 0x01 = Актвен, 0x00 = Выключен
+    pkt[4] = speed_limit;                     // Значение знака (км/ч)
+    pkt[5] = 0x00;                            // Доп. знаки (дождь, время и т.д.)
+    pkt[6] = 0x00;                            // Резерв
+
+    // Calc CS ( inversion sum of all bytes in DATA)
+    uint32_t sum = 0;
+    for (size_t i = 1; i < 7; i++) {
+        sum += pkt[i];
+    }
+    pkt[7] = (uint8_t)(~sum);
+
+    //  Push bytes of the packet directly into the circular buffer of the queue HU -> CAN
+    BaseType_t res = xRingbufferSend(
+        ringbuf_hu_to_can, 
+        pkt, 
+        sizeof(pkt), 
+        pdMS_TO_TICKS(10) // Timeout for waiting for space in the buffer
+    );
+
+    return (res == pdTRUE);
+}
+
+/**
+ * @brief NULLing PLA/PDC (0x26) and CS
+ */
+
+static void clear_pdc_payload(uint8_t *pkt, size_t len) {
+    if (len < 4 || pkt[1] != 0x26) return;
+
+    g_vehicle.pdc_payload_len = pkt[2];
+
+    // Очищаем байты дистанций
+    memset(&pkt[3], 0x00, g_vehicle.pdc_payload_len);
+
+    // Пересчитываем CS (инверсия суммы байт от CMD до конца DATA)
+    uint32_t sum = 0;
+    for (size_t i = 1; i < len - 1; i++) {
+        sum += pkt[i];
+    }
+    pkt[len - 1] = (uint8_t)(~sum);
 }
 
 /**
@@ -195,25 +263,18 @@ static void filter_and_forward_can_to_hu(const uint8_t *in_buf, size_t in_len) {
         // --- ПАКЕТ ПОЛНОСТЬЮ СОБРАН В buf[pos ... pos + total_pkt_len - 1] ---
         
         g_pkt_count_can_to_hu++;
-
         send_brief_to_usb("CAN->HU", g_pkt_count_can_to_hu, total_pkt_len, cmd);
 
-            // Check the current speed
-            parse_vehicle_speed(&buf[pos], total_pkt_len);
+        // Обновляем текущее состояние скорости
+        parse_vehicle_speed(&buf[pos], total_pkt_len);
 
-        // Remake PDC / PLA 3.0 (0x26 & 0x20)
-        if (cmd == 0x26 || cmd == 0x20) {
-            if (g_speed_over_40) {
-                // Upon exceeding 40 km/h, intercept and replace with "all clear"
-                send_dynamic_pdc_clear(&buf[pos], total_pkt_len);
-            } else {
-                // For speeds <= 40 km/h, forward the original packet
-                uart_write_bytes(HU_UART_PORT, (const char *)&buf[pos], total_pkt_len);
-            }
-        } else {
-            // Other packets (steering, climate, doors) are passed through without changes
-            uart_write_bytes(HU_UART_PORT, (const char *)&buf[pos], total_pkt_len);
+        // Если это кадр визуализации PLA/PDC (0x26) и скорость > 40 км/ч — мутируем его
+        if (cmd == 0x26 && g_vehicle.speed_over) {
+            clear_pdc_payload(&buf[pos], total_pkt_len);
         }
+
+        // Единая точка отправки абсолютно для ВСЕХ пакетов в ГУ
+        uart_write_bytes(HU_UART_PORT, (const char *)&buf[pos], total_pkt_len);
 
         // Сдвигаемся на длину успешного пакета
         pos += total_pkt_len;
