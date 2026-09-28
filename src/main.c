@@ -87,6 +87,7 @@ static const char* get_packet_type_name(uint8_t cmd) {
         case 0x24: return "SPEED_STATUS";
         case 0x26: return "PDC_PLA3";
         case 0x21: return "STEERING_WHEEL";
+        case 0x32: return "ROAD_SIGN";
         case 0x40: return "CLIMATE_CONTROL";
         case 0x28:
         case 0x50: return "SYSTEM_INFO";
@@ -133,6 +134,10 @@ static void send_dynamic_pdc_clear(void) {
 static void parse_vehicle_speed(const uint8_t *pkt, size_t len) {
     uint8_t cmd = pkt[1];
 
+    if (g_vehicle.pdc_payload_len == 0 && cmd == 0x26 && len >= 3) {
+        g_vehicle.pdc_payload_len = pkt[2];
+    }
+
     // Packet 0x14 (Vehicle Status)
     if (cmd == 0x14 && len >= 5) {
         g_vehicle.current_speed_kmh = pkt[4];
@@ -146,7 +151,7 @@ static void parse_vehicle_speed(const uint8_t *pkt, size_t len) {
     g_vehicle.speed_over = (g_vehicle.current_speed_kmh > 40);
 
     // Upon initial exceeding the 40 km/h threshold, send a cancellation packet
-    if (g_vehicle.speed_over && !prev_state) {
+    if (!prev_state && g_vehicle.speed_over) {
        send_dynamic_pdc_clear();
     }
 }
@@ -196,16 +201,47 @@ bool inject_road_sign_to_queue(uint8_t speed_limit) {
 }
 
 /**
+ * @brief Периодическая проверка и инжекция знака ограничения скорости
+ */
+static void process_road_sign_injection(void) {
+    static TickType_t last_send_time = 0;
+    TickType_t now = xTaskGetTickCount();
+
+    // 1. Определяем желаемый знак согласно скорости (исправлен порядок условий)
+    uint8_t target_sign = 30;
+    
+    if (g_vehicle.current_speed_kmh > 70) {
+        target_sign = 100;
+    } else if (g_vehicle.current_speed_kmh > 50) {
+        target_sign = 70;
+    }
+
+    // 2. Отправляем если:
+    //    а) Знак изменился (мгновенная реакция)
+    //    б) Прошло более 2000 мс (поддержание знака на приборке VAG BAP)
+    bool sign_changed = (target_sign != g_vehicle.current_speed_limit);
+    bool timeout_expired = ((now - last_send_time) >= pdMS_TO_TICKS(2000));
+
+    if (sign_changed || timeout_expired) {
+
+        if (inject_road_sign_to_queue(target_sign)) {
+            g_vehicle.current_speed_limit = target_sign;
+            last_send_time = now;
+        }
+    }
+}
+
+/**
  * @brief NULLing PLA/PDC (0x26) and CS
  */
 
 static void clear_pdc_payload(uint8_t *pkt, size_t len) {
     if (len < 4 || pkt[1] != 0x26) return;
 
-    g_vehicle.pdc_payload_len = pkt[2];
+    if (len > 64) return;
 
     // Очищаем байты дистанций
-    memset(&pkt[3], 0x00, g_vehicle.pdc_payload_len);
+    memset(&pkt[3], 0x00, len - 4); // Clear DATA bytes (from index 3 to len-2)
 
     // Пересчитываем CS (инверсия суммы байт от CMD до конца DATA)
     uint32_t sum = 0;
@@ -218,7 +254,7 @@ static void clear_pdc_payload(uint8_t *pkt, size_t len) {
 /**
  * @brief Stream parser and filter for CANBOX -> HU packets
  */
-static void filter_and_forward_can_to_hu(const uint8_t *in_buf, size_t in_len) {
+static void parser_and_forward_can_to_hu(const uint8_t *in_buf, size_t in_len) {
     static uint8_t buf[512];
     static size_t buf_len = 0;
 
@@ -262,6 +298,7 @@ static void filter_and_forward_can_to_hu(const uint8_t *in_buf, size_t in_len) {
 
         // --- ПАКЕТ ПОЛНОСТЬЮ СОБРАН В buf[pos ... pos + total_pkt_len - 1] ---
         
+        
         g_pkt_count_can_to_hu++;
         send_brief_to_usb("CAN->HU", g_pkt_count_can_to_hu, total_pkt_len, cmd);
 
@@ -272,6 +309,8 @@ static void filter_and_forward_can_to_hu(const uint8_t *in_buf, size_t in_len) {
         if (cmd == 0x26 && g_vehicle.speed_over) {
             clear_pdc_payload(&buf[pos], total_pkt_len);
         }
+
+        
 
         // Единая точка отправки абсолютно для ВСЕХ пакетов в ГУ
         uart_write_bytes(HU_UART_PORT, (const char *)&buf[pos], total_pkt_len);
@@ -285,6 +324,7 @@ static void filter_and_forward_can_to_hu(const uint8_t *in_buf, size_t in_len) {
         memmove(buf, buf + pos, buf_len - pos);
         buf_len -= pos;
     }
+    
 }
 
 /**
@@ -304,7 +344,7 @@ void canbox_to_hu_task(void *pvParameters) {
         uint8_t *data = (uint8_t *)xRingbufferReceiveUpTo(ringbuf_can_to_hu, &size, pdMS_TO_TICKS(5), BUF_SIZE);
         
         if (data != NULL) {
-            filter_and_forward_can_to_hu(data, size);
+            parser_and_forward_can_to_hu(data, size);
             vRingbufferReturnItem(ringbuf_can_to_hu, (void *)data);
         }
 
@@ -380,6 +420,8 @@ void hu_to_canbox_task(void *pvParameters) {
             parse_and_forward_hu_to_can(data, size);
             vRingbufferReturnItem(ringbuf_hu_to_can, (void *)data);
         }
+
+        process_road_sign_injection();
 
         vTaskDelay(pdMS_TO_TICKS(1));
     }
